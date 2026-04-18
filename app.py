@@ -2,6 +2,7 @@ import base64
 import html
 import json
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime
@@ -33,6 +34,77 @@ LEVEL_LABELS = {
 }
 CORE_LEVELS = (1, 2, 3, 4)
 DETAIL_LEVELS = (5, 6, 7)
+
+DRIFTOMRADEN = [
+    ("BU", "Burlöv"),
+    ("ES", "Eslöv"),
+    ("LO", "Lomma"),
+    ("LU", "Lund"),
+    ("MA", "Malmö"),
+    ("SV", "Svedala"),
+    ("XA", "Övergripande"),
+]
+
+DISCIPLINER = [
+    ("SA", "Avfallshantering (Mätpunkter, styrning)"),
+    ("AP", "Avloppspumpning"),
+    ("AR", "Avloppsrening"),
+    ("AM", "Avlopp Motor-/Reglerventil"),
+    ("AD", "Dagvattenspumpning"),
+    ("FA", "Fastighet"),
+    ("CS", "Kontrollsystem"),
+    ("LA", "Ledningsnät avlopp"),
+    ("LS", "Ledningsnät styrfunktioner"),
+    ("TA", "LTA stationer"),
+    ("LV", "Ledningsnät dricksvattendistribution"),
+    ("NB", "Nederbördsmätning"),
+    ("VB", "Vattenborrning"),
+    ("VK", "Vattenkiosker"),
+    ("VM", "Dricksvatten Motor-/Reglerventil"),
+    ("VS", "Dricksvattendistribution-Tryckstegringsstationer"),
+    ("VT", "Dricksvattendistribution-Vattentorn"),
+    ("VV", "Vattenverk"),
+]
+
+FUNKTIONSKLASSER = [
+    ("A", "Övergripande funktioner"),
+    ("B", "Mätande funktioner"),
+    ("C", "Filtrerande funktioner"),
+    ("D", "Separerande funktioner"),
+    ("E", "Doserande funktioner"),
+    ("F", "Renande funktioner"),
+    ("G", "Transformerande funktioner"),
+    ("H", "Förädlande funktioner"),
+    ("J", "Transporterande funktioner"),
+    ("K", "Elinstallationer ≥1kV"),
+    ("L", "Skapande/sönderdelande"),
+    ("M", "Desinficerande/steriliserande"),
+    ("N", "Elinstallationer <1kV"),
+    ("P", "Produkthanterande funktioner"),
+    ("U", "Levererade funktioner"),
+    ("V", "Förvarande funktioner"),
+    ("W", "Administrativa funktioner"),
+    ("X", "Försörjande eller stödjande"),
+    ("Y", "Kommunikation och information"),
+    ("Z", "Infrastruktursfunktioner"),
+]
+
+CODE_PATTERN = re.compile(r"^([A-ZÄÖÅa-zäöå]+)(\d*)$")
+
+VERSION_DIFF_FIELDS = [
+    ("status", "Status"),
+    ("valid_from", "Gäller från"),
+    ("valid_to", "Gäller till"),
+    ("source_drawing", "Ritning"),
+    ("drawing_revision", "Ritningsrevision"),
+    ("approved_by", "Godkänd av"),
+    ("approved_at", "Godkänd datum"),
+    ("change_summary", "Ändringssammanfattning"),
+    ("notes", "Anteckningar"),
+    ("jira_issue_key", "Jira-ärende"),
+    ("jira_decision", "Beslut"),
+    ("created_by", "Skapad av"),
+]
 
 
 STYLE = """
@@ -465,6 +537,132 @@ def build_designation(data):
         parts.append((value or "").strip())
     parts = [part for part in parts if part]
     return "=" + ".".join(parts) if parts else ""
+
+
+def parse_code(value):
+    if not value:
+        return (None, None)
+    match = CODE_PATTERN.match(value.strip())
+    if not match:
+        return (None, None)
+    letters = match.group(1).upper()
+    numeric = match.group(2)
+    number = int(numeric) if numeric else None
+    return (letters, number)
+
+
+def format_code(letters, number):
+    return f"{letters}{number:02d}"
+
+
+def _next_number(conn, column, where_sql, where_params, letters):
+    rows = conn.execute(
+        f"SELECT {column} AS code FROM objects WHERE {where_sql} AND {column} IS NOT NULL AND {column} <> ''",
+        where_params,
+    ).fetchall()
+    max_n = 0
+    for row in rows:
+        code_letters, code_number = parse_code(row["code"])
+        if code_letters == letters and code_number is not None and code_number > max_n:
+            max_n = code_number
+    return max_n + 1
+
+
+def next_level4_code(conn, level1, level2, level3, letters):
+    n = _next_number(
+        conn,
+        "level4",
+        "COALESCE(level1, '') = ? AND COALESCE(level2, '') = ? AND COALESCE(level3, '') = ?"
+        " AND COALESCE(level5, '') = '' AND COALESCE(level6, '') = '' AND COALESCE(level7, '') = ''",
+        (level1 or "", level2 or "", level3 or ""),
+        letters,
+    )
+    return format_code(letters, n)
+
+
+def next_detail_code(conn, level_index, parent_object_id, data, letters):
+    where_parts = ["parent_object_id = ?"]
+    params = [parent_object_id]
+    for ancestor in range(5, level_index):
+        where_parts.append(f"COALESCE(level{ancestor}, '') = ?")
+        params.append(data.get(f"level{ancestor}", "") or "")
+    for descendant in range(level_index + 1, 8):
+        where_parts.append(f"COALESCE(level{descendant}, '') = ''")
+    n = _next_number(
+        conn,
+        f"level{level_index}",
+        " AND ".join(where_parts),
+        tuple(params),
+        letters,
+    )
+    return format_code(letters, n)
+
+
+def autocomplete_codes(conn, data, parent_object_id):
+    """If a level is given as letters-only, auto-append the next löpnummer."""
+    letters4, num4 = parse_code(data.get("level4", ""))
+    if letters4 and num4 is None:
+        data["level4"] = next_level4_code(
+            conn, data.get("level1", ""), data.get("level2", ""), data.get("level3", ""), letters4
+        )
+    if parent_object_id:
+        for idx in (5, 6, 7):
+            raw = data.get(f"level{idx}", "")
+            letters, num = parse_code(raw)
+            if letters and num is None:
+                data[f"level{idx}"] = next_detail_code(conn, idx, parent_object_id, data, letters)
+    return data
+
+
+def options_html(values, selected, placeholder="Välj ..."):
+    selected_norm = (selected or "").strip()
+    items = [f'<option value="">{esc(placeholder)}</option>']
+    present = False
+    for code, label in values:
+        is_sel = code == selected_norm
+        if is_sel:
+            present = True
+        items.append(
+            f'<option value="{esc(code)}" {"selected" if is_sel else ""}>{esc(code)} — {esc(label)}</option>'
+        )
+    if selected_norm and not present:
+        items.append(f'<option value="{esc(selected_norm)}" selected>{esc(selected_norm)} (befintligt värde)</option>')
+    return "".join(items)
+
+
+def funktionsklass_options_html(selected):
+    """Select for level 4. Keeps existing full code (e.g. F01) selected as custom; letter-only values matched against kodlistan."""
+    selected_norm = (selected or "").strip()
+    letters, _ = parse_code(selected_norm)
+    items = [
+        '<option value="">Välj bokstav (löpnummer fylls i automatiskt)</option>'
+    ]
+    matched_letter = None
+    for letter, label in FUNKTIONSKLASSER:
+        is_sel = letter == letters
+        if is_sel:
+            matched_letter = letter
+        items.append(
+            f'<option value="{esc(letter)}" {"selected" if is_sel else ""}>{esc(letter)} — {esc(label)}</option>'
+        )
+    if selected_norm and not matched_letter:
+        items.append(
+            f'<option value="{esc(selected_norm)}" selected>{esc(selected_norm)} (befintligt värde)</option>'
+        )
+    return "".join(items)
+
+
+def diff_between_versions(prev_row, curr_row):
+    if prev_row is None:
+        return []
+    diffs = []
+    for key, label in VERSION_DIFF_FIELDS:
+        old_val = (prev_row[key] if prev_row[key] is not None else "") or ""
+        new_val = (curr_row[key] if curr_row[key] is not None else "") or ""
+        if old_val != new_val:
+            diffs.append((label, old_val, new_val))
+    return diffs
+
 
 def jira_config():
     return {
@@ -945,7 +1143,7 @@ def render_object_form(data, errors, action, heading, submit_label, mode="base",
     detail_fields = "".join(
         f"""
         <label>{level_label(index)}
-          <input type="text" name="level{index}" value="{esc(data[f'level{index}'])}">
+          <input class="mono" type="text" name="level{index}" value="{esc(data[f'level{index}'])}" placeholder="T.ex. JQ (löpnummer föreslås)">
         </label>
         """
         for index in DETAIL_LEVELS
@@ -997,27 +1195,33 @@ def render_object_form(data, errors, action, heading, submit_label, mode="base",
             <input type="text" name="title" value="{esc(data['title'])}" required>
           </label>
           <label>{level_label(4)} *
-            <input class="mono" type="text" name="level4" value="{esc(data['level4'])}" required>
+            <select class="mono" name="level4" required>
+              {funktionsklass_options_html(data['level4'])}
+            </select>
           </label>
           <label>ToppID / full beteckning
             <input class="mono" type="text" value="{esc(generated_designation or 'Genereras automatiskt när nivåerna är ifyllda')}" readonly>
           </label>
         </div>
-        <div class="muted">ToppID är inte fri text utan byggs automatiskt av nivå 1-7 med punkt mellan nivåerna.</div>
+        <div class="muted">Välj bokstav för funktionsklass — löpnummer (t.ex. 01, 02) sätts automatiskt per anläggning. Vill du låsa ett specifikt löpnummer kan du skriva det själv, t.ex. <span class="mono">F05</span>, genom att välja valfri bokstav och sedan justera efteråt (ej vanligt).</div>
       </section>
 
       <section class="form-section">
         <h3>Toppnod nivå 1-3</h3>
-        <p>Driftområde, disciplin och funktions-ID för anläggning är toppnoden. Den får återkomma mellan flera huvudsystem.</p>
+        <p>Driftområde och disciplin väljs ur kodlista. Funktions-ID för anläggning är fritext (ansöks externt och matas in när koden är godkänd).</p>
         <div class="form-grid">
           <label>{level_label(1)}
-            <input type="text" name="level1" value="{esc(data['level1'])}">
+            <select class="mono" name="level1">
+              {options_html(DRIFTOMRADEN, data['level1'], 'Välj driftområde')}
+            </select>
           </label>
           <label>{level_label(2)}
-            <input type="text" name="level2" value="{esc(data['level2'])}">
+            <select class="mono" name="level2">
+              {options_html(DISCIPLINER, data['level2'], 'Välj disciplin')}
+            </select>
           </label>
           <label>{level_label(3)}
-            <input type="text" name="level3" value="{esc(data['level3'])}">
+            <input class="mono" type="text" name="level3" value="{esc(data['level3'])}" placeholder="Ex: 001 (fritext, ansöks)">
           </label>
           <label>Registrerad av
             <input type="text" name="created_by" value="{esc(data['created_by'])}" placeholder="Ditt namn eller roll">
@@ -1028,7 +1232,7 @@ def render_object_form(data, errors, action, heading, submit_label, mode="base",
       <details class="form-section" {'open' if show_details_open else ''}>
         <summary>Fördjupning nivå 5-7</summary>
         <div class="details-body">
-          <p>Lämna tomt tills projekteringen har kommit dit. Här registreras processenhet, utrustningsenhet och kontrollenhet. Varje rad får sitt eget populärnamn.</p>
+          <p>Lämna tomt tills projekteringen har kommit dit. Skriv två bokstäver (t.ex. <span class="mono">JQ</span>) så sätts löpnumret automatiskt per förälder. Vill du låsa ett värde kan du skriva hela koden (t.ex. <span class="mono">JQ03</span>).</p>
           <div class="form-grid">{detail_fields}</div>
         </div>
       </details>
@@ -1162,6 +1366,9 @@ def create_object(conn, data):
         errors.append("Gäller till får inte vara tidigare än gäller från.")
     if errors:
         return errors
+
+    data = autocomplete_codes(conn, data, parent_object_id)
+    data["designation"] = build_designation(data)
 
     timestamp = now_iso()
     try:
@@ -1457,6 +1664,41 @@ def render_object_detail(conn, object_id, flash):
           </table>
         </section>
         """
+    diff_cards = []
+    for i in range(len(versions) - 1):
+        curr = versions[i]
+        prev = versions[i + 1]
+        diffs = diff_between_versions(prev, curr)
+        if not diffs:
+            inner = '<p class="muted">Inga fältändringar registrerade mellan dessa versioner.</p>'
+        else:
+            diff_rows = "".join(
+                f"""<tr>
+                    <td><strong>{esc(label)}</strong></td>
+                    <td class="mono">{esc(old) if old else '<span class="muted">(tomt)</span>'}</td>
+                    <td class="mono">{esc(new) if new else '<span class="muted">(tomt)</span>'}</td>
+                </tr>"""
+                for label, old, new in diffs
+            )
+            inner = f"""<table>
+              <thead><tr><th>Fält</th><th>Före</th><th>Efter</th></tr></thead>
+              <tbody>{diff_rows}</tbody>
+            </table>"""
+        diff_cards.append(f"""
+        <article class="card">
+          <h3 style="margin:0 0 6px;">v{prev['version_no']} → v{curr['version_no']}</h3>
+          <div class="muted" style="margin-bottom:10px;">{esc(fmt_datetime(curr['changed_at']))} — {esc(curr['created_by'] or 'okänd aktör')}</div>
+          {inner}
+        </article>
+        """)
+    diff_section = ""
+    if diff_cards:
+        diff_section = f"""
+        <section class="table-wrap">
+          <div class="table-head"><h2>Ändringshistorik per version</h2></div>
+          <div style="padding:18px; display:grid; gap:14px;">{''.join(diff_cards)}</div>
+        </section>
+        """
     body += f"""
     <section class="table-wrap">
       <div class="table-head">
@@ -1478,6 +1720,7 @@ def render_object_detail(conn, object_id, flash):
         <tbody>{version_rows}</tbody>
       </table>
     </section>
+    {diff_section}
     <section class="table-wrap">
       <div class="table-head">
         <h2>Audit-logg</h2>

@@ -568,49 +568,32 @@ def _next_number(conn, column, where_sql, where_params, letters):
     return max_n + 1
 
 
-def next_level4_code(conn, level1, level2, level3, letters):
-    n = _next_number(
-        conn,
-        "level4",
-        "COALESCE(level1, '') = ? AND COALESCE(level2, '') = ? AND COALESCE(level3, '') = ?"
-        " AND COALESCE(level5, '') = '' AND COALESCE(level6, '') = '' AND COALESCE(level7, '') = ''",
-        (level1 or "", level2 or "", level3 or ""),
-        letters,
-    )
-    return format_code(letters, n)
-
-
-def next_detail_code(conn, level_index, parent_object_id, data, letters):
-    where_parts = ["parent_object_id = ?"]
-    params = [parent_object_id]
-    for ancestor in range(5, level_index):
+def _next_code_scoped_by_ancestors(conn, target_level, data, letters):
+    """Find next löpnummer for `letters` on target_level, scoping by the values in ancestor levels."""
+    where_parts = []
+    params = []
+    for ancestor in range(1, target_level):
         where_parts.append(f"COALESCE(level{ancestor}, '') = ?")
         params.append(data.get(f"level{ancestor}", "") or "")
-    for descendant in range(level_index + 1, 8):
-        where_parts.append(f"COALESCE(level{descendant}, '') = ''")
-    n = _next_number(
-        conn,
-        f"level{level_index}",
-        " AND ".join(where_parts),
-        tuple(params),
-        letters,
-    )
+    where_sql = " AND ".join(where_parts) if where_parts else "1=1"
+    n = _next_number(conn, f"level{target_level}", where_sql, tuple(params), letters)
     return format_code(letters, n)
 
 
-def autocomplete_codes(conn, data, parent_object_id):
-    """If a level is given as letters-only, auto-append the next löpnummer."""
-    letters4, num4 = parse_code(data.get("level4", ""))
-    if letters4 and num4 is None:
-        data["level4"] = next_level4_code(
-            conn, data.get("level1", ""), data.get("level2", ""), data.get("level3", ""), letters4
-        )
+def autocomplete_codes(conn, data, parent_object_id=None):
+    """If any level is given as letters-only, auto-append the next löpnummer scoped by ancestor levels.
+    If a parent object exists, inherit L1-L4 from parent so subunits never renumber the function class."""
     if parent_object_id:
-        for idx in (5, 6, 7):
-            raw = data.get(f"level{idx}", "")
-            letters, num = parse_code(raw)
-            if letters and num is None:
-                data[f"level{idx}"] = next_detail_code(conn, idx, parent_object_id, data, letters)
+        parent = get_object(conn, parent_object_id)
+        if parent:
+            for idx in (1, 2, 3, 4):
+                data[f"level{idx}"] = parent[f"level{idx}"] or ""
+    start = 5 if parent_object_id else 4
+    for idx in range(start, 8):
+        raw = data.get(f"level{idx}", "")
+        letters, num = parse_code(raw)
+        if letters and num is None:
+            data[f"level{idx}"] = _next_code_scoped_by_ancestors(conn, idx, data, letters)
     return data
 
 
@@ -1188,22 +1171,23 @@ def render_object_form(data, errors, action, heading, submit_label, mode="base",
       {parent_note}
 
       <section class="form-section">
-        <h3>Huvudsystem</h3>
-        <p>Populärnamn och nivå 4 är det viktigaste här. Nivå 1-3 är toppnod och är ofta återkommande.</p>
+        <h3>{'Den här ' + focus_name.lower() if mode == 'detail' else 'Huvudsystem'}</h3>
+        <p>{'Ge underposten ett eget populärnamn. Nivå 4 är ärvd från huvudposten och går inte att ändra här.' if mode == 'detail' else 'Populärnamn och nivå 4 är det viktigaste här. Nivå 1-3 är toppnod och är ofta återkommande.'}</p>
         <div class="form-grid">
-          <label>Populärnamn *
-            <input type="text" name="title" value="{esc(data['title'])}" required>
+          <label>{'Populärnamn för ' + focus_name.lower() if mode == 'detail' else 'Populärnamn'} *
+            <input type="text" name="title" value="{esc(data['title'])}" required placeholder="{esc('T.ex. Pump 1, Omrörare, Nivåmätare' if mode == 'detail' else 'T.ex. Inloppskanaler 1')}">
           </label>
           <label>{level_label(4)} *
-            <select class="mono" name="level4" required>
+            <select class="mono" name="level4" required {'disabled' if mode == 'detail' else ''}>
               {funktionsklass_options_html(data['level4'])}
             </select>
+            {'<input type="hidden" name="level4" value="' + esc(data['level4']) + '">' if mode == 'detail' else ''}
           </label>
           <label>ToppID / full beteckning
             <input class="mono" type="text" value="{esc(generated_designation or 'Genereras automatiskt när nivåerna är ifyllda')}" readonly>
           </label>
         </div>
-        <div class="muted">Välj bokstav för funktionsklass — löpnummer (t.ex. 01, 02) sätts automatiskt per anläggning. Vill du låsa ett specifikt löpnummer kan du skriva det själv, t.ex. <span class="mono">F05</span>, genom att välja valfri bokstav och sedan justera efteråt (ej vanligt).</div>
+        <div class="muted">{'Funktionsklassen är ärvd från huvudposten. Fyll i processenhet/utrustning/kontrollenhet nedan.' if mode == 'detail' else 'Välj bokstav för funktionsklass — löpnummer (t.ex. 01, 02) sätts automatiskt per anläggning.'}</div>
       </section>
 
       <section class="form-section">
